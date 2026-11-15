@@ -143,7 +143,7 @@ git push origin main
 git push origin v0.1.0
 ```
 
-标签版本必须与 `package.json`、`src-tauri/Cargo.toml` 和 `src-tauri/tauri.conf.json` 中的版本一致。构建成功后检查草稿 Release 中的安装包和校验文件，再手动发布。
+标签版本必须与 `package.json`、`src-tauri/Cargo.toml` 和 `src-tauri/tauri.conf.json` 中的版本一致。不要预先手动创建同 tag 的 Release；工作流会把 MSI 和校验文件上传到同一个草稿 Release，检查无误后再手动发布。
 
 ## 项目结构
 
