@@ -1,0 +1,150 @@
+name: CI/CD
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  verify:
+    name: Windows verification
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Test frontend
+        run: npm test
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri\Cargo.toml --check
+
+      - name: Lint Rust
+        run: cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
+
+      - name: Test Rust
+        run: cargo test --manifest-path src-tauri\Cargo.toml
+
+  release:
+    name: Build and draft GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Verify tag matches application version
+        shell: pwsh
+        run: |
+          $tagVersion = $env:RELEASE_TAG.TrimStart("v")
+          $tauriVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $packageVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $cargoText = Get-Content src-tauri/Cargo.toml -Raw
+          if ($cargoText -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
+            throw "Unable to read the application version from Cargo.toml"
+          }
+          $cargoVersion = $Matches[1]
+          if (
+            $tagVersion -ne $tauriVersion -or
+            $tagVersion -ne $packageVersion -or
+            $tagVersion -ne $cargoVersion
+          ) {
+            throw "Tag $env:RELEASE_TAG does not match Tauri $tauriVersion, package $packageVersion and Cargo $cargoVersion"
+          }
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and create draft release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "SimpleGit ${{ github.ref_name }}"
+          releaseBody: |
+            SimpleGit ${{ github.ref_name }} Windows x64 安装包。
+
+            当前安装包尚未代码签名，Windows 可能显示 SmartScreen 提示。
+            下载后请核对附带的 SHA-256 校验文件。
+          releaseDraft: true
+          prerelease: false
+
+      - name: Generate MSI checksum
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem src-tauri/target/release/bundle/msi/*.msi |
+            Where-Object Length -GT 0 |
+            Select-Object -First 1
+          if (-not $msi) {
+            throw "No MSI installer was produced"
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $msi.FullName).Hash.ToLowerInvariant()
+          $checksumPath = Join-Path $msi.DirectoryName "$($msi.BaseName).sha256"
+          "$hash  $($msi.Name)" | Set-Content -LiteralPath $checksumPath -Encoding utf8NoBOM
+          "checksum=$checksumPath"
+
+      - name: Upload checksum to release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $checksum = Get-ChildItem src-tauri/target/release/bundle/msi/*.sha256 | Select-Object -First 1
+          if (-not $checksum) {
+            throw "Checksum file was not generated"
+          }
+          gh release upload $env:RELEASE_TAG $checksum.FullName --clobber
